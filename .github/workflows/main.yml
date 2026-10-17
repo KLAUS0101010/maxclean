@@ -1,0 +1,85 @@
+name: Build MAX Clean
+on:
+  workflow_dispatch:
+    inputs:
+      apk_url:
+        description: "Direct link to the official MAX .apk (see INSTRUCTION-RU.md, step 2)"
+        required: true
+      publish:
+        description: "Also publish the result as a public Release (true/false)"
+        required: false
+        default: "false"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: 17 }
+
+      - name: Test the patcher
+        run: python3 -I tests/test_patch.py
+
+      - name: Download MAX
+        env: { APK_URL: "${{ inputs.apk_url }}" }
+        run: |
+          curl -L --fail --retry 3 -o max.apk "$APK_URL"
+          ls -la max.apk
+          unzip -l max.apk | grep -q "AndroidManifest.xml" || { echo "This is not an .apk file (maybe .xapk/.apks bundle or a web page)."; exit 1; }
+          unzip -l max.apk | grep -q "classes.dex" || { echo "No classes.dex inside: not a normal universal apk."; exit 1; }
+
+      - name: Get apktool
+        run: curl -L --fail -o apktool.jar https://github.com/iBotPeaches/Apktool/releases/download/v2.10.0/apktool_2.10.0.jar
+
+      - name: Unpack
+        run: java -Xmx4g -jar apktool.jar d -f -o dec max.apk
+
+      - name: Report (what is inside the original MAX)
+        run: |
+          python3 -I analyze_apk.py dec > report.txt
+          { echo '`'; head -c 60000 report.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: report
+          path: report.txt
+
+      - name: Patch
+        run: python3 -I patch_max.py dec 2>&1 | tee patch-log.txt
+
+      - name: Repack
+        run: java -Xmx4g -jar apktool.jar b -o unsigned.apk dec
+
+      - name: Restore signing key
+        uses: actions/cache@v4
+        with:
+          path: maxclean.jks
+          key: maxclean-signing-key-v1
+
+      - name: Sign
+        run: |
+          BT=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)
+          if [ ! -f maxclean.jks ]; then
+            keytool -genkeypair -keystore maxclean.jks -storepass maxclean -keypass maxclean \
+              -alias maxclean -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=MAX Clean"
+          fi
+          "$BT/zipalign" -f -p 4 unsigned.apk aligned.apk
+          "$BT/apksigner" sign --ks maxclean.jks --ks-pass pass:maxclean --key-pass pass:maxclean \
+            --out MAX-Clean.apk aligned.apk
+          "$BT/apksigner" verify --verbose MAX-Clean.apk | head -5
+          ls -la MAX-Clean.apk
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MAX-Clean
+          path: MAX-Clean.apk
+
+      - name: Publish release (optional)
+        if: ${{ inputs.publish == 'true' }}
+        env: { GH_TOKEN: "${{ github.token }}" }
+        run: gh release create "clean-${{ github.run_number }}" MAX-Clean.apk --title "MAX Clean build ${{ github.run_number }}" --notes "Official MAX with third-party trackers removed. Built from the official apk by patch_max.py."
