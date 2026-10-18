@@ -36,7 +36,9 @@ jobs:
         with: { distribution: temurin, java-version: 17 }
 
       - name: Test the patcher
-        run: python3 -I tests/test_patch.py
+        run: |
+          python3 -I tests/test_patch.py
+          python3 -I tests/test_dex_api.py
 
       - name: Download MAX
         env: { APK_URL: "${{ inputs.apk_url }}" }
@@ -51,7 +53,10 @@ jobs:
 
       - name: Unpack
         env: { DECODE: "${{ matrix.decode }}" }
-        run: java -Xmx4g -jar apktool.jar d $DECODE -f -o dec max.apk
+        run: |
+          java -Xmx4g -jar apktool.jar d $DECODE -f -o dec max.apk
+          # apktool picks too low a "api level" for the code after -r; this raises it to what the dex files need
+          python3 -I dex_api.py max.apk dec
 
       - name: Report (what is inside the original MAX)
         if: ${{ matrix.name == 'D-control' }}
