@@ -6,9 +6,10 @@ on:
         description: "Direct link to the official MAX .apk (see INSTRUCTION-RU.md, step 2)"
         required: true
       publish:
-        description: "Also publish the result as a public Release (true/false)"
-        required: false
-        default: "false"
+        description: "Also publish the results as a public Release"
+        required: true
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -17,6 +18,18 @@ jobs:
   build:
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # D: change nothing, only repack and re-sign. If D already misbehaves, our patches are not the cause.
+          - { name: "D-control", mode: "none",  decode: "-r" }
+          # A: only the tracker host names -> 0.0.0.0
+          - { name: "A-hosts",   mode: "hosts", decode: "-r" }
+          # B: A + stubs for send-methods + zero advertising id (no manifest / resource changes)
+          - { name: "B-code",    mode: "code",  decode: "-r" }
+          # C: everything: B + manifest permission + app name "MAX Clean" (resources are decoded and rebuilt)
+          - { name: "C-full",    mode: "all",   decode: "" }
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-java@v4
@@ -37,49 +50,42 @@ jobs:
         run: curl -L --fail -o apktool.jar https://github.com/iBotPeaches/Apktool/releases/download/v2.10.0/apktool_2.10.0.jar
 
       - name: Unpack
-        run: java -Xmx4g -jar apktool.jar d -f -o dec max.apk
+        env: { DECODE: "${{ matrix.decode }}" }
+        run: java -Xmx4g -jar apktool.jar d $DECODE -f -o dec max.apk
 
       - name: Report (what is inside the original MAX)
+        if: ${{ matrix.name == 'D-control' }}
         run: |
           python3 -I analyze_apk.py dec > report.txt
-          { echo '`'; head -c 60000 report.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          { echo '```'; head -c 60000 report.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
 
       - uses: actions/upload-artifact@v4
+        if: ${{ matrix.name == 'D-control' }}
         with:
           name: report
           path: report.txt
 
-      - name: Patch
-        run: python3 -I patch_max.py dec 2>&1 | tee patch-log.txt
+      - name: Patch (${{ matrix.mode }})
+        run: python3 -I patch_max.py dec ${{ matrix.mode }} 2>&1 | tee patch-log.txt
 
       - name: Repack
         run: java -Xmx4g -jar apktool.jar b -o unsigned.apk dec
 
-      - name: Restore signing key
-        uses: actions/cache@v4
-        with:
-          path: maxclean.jks
-          key: maxclean-signing-key-v1
-
-      - name: Sign
+      - name: Sign (same key for every variant, so they can be installed over each other)
         run: |
           BT=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)
-          if [ ! -f maxclean.jks ]; then
-            keytool -genkeypair -keystore maxclean.jks -storepass maxclean -keypass maxclean \
-              -alias maxclean -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=MAX Clean"
-          fi
           "$BT/zipalign" -f -p 4 unsigned.apk aligned.apk
           "$BT/apksigner" sign --ks maxclean.jks --ks-pass pass:maxclean --key-pass pass:maxclean \
-            --out MAX-Clean.apk aligned.apk
-          "$BT/apksigner" verify --verbose MAX-Clean.apk | head -5
-          ls -la MAX-Clean.apk
+            --out MAX-Clean-${{ matrix.name }}.apk aligned.apk
+          "$BT/apksigner" verify --verbose MAX-Clean-${{ matrix.name }}.apk | head -5
+          ls -la MAX-Clean-${{ matrix.name }}.apk
 
       - uses: actions/upload-artifact@v4
         with:
-          name: MAX-Clean
-          path: MAX-Clean.apk
+          name: MAX-Clean-${{ matrix.name }}
+          path: MAX-Clean-${{ matrix.name }}.apk
 
       - name: Publish release (optional)
-        if: ${{ inputs.publish == 'true' }}
+        if: ${{ inputs.publish }}
         env: { GH_TOKEN: "${{ github.token }}" }
-        run: gh release create "clean-${{ github.run_number }}" MAX-Clean.apk --title "MAX Clean build ${{ github.run_number }}" --notes "Official MAX with third-party trackers removed. Built from the official apk by patch_max.py."
+        run: gh release create "clean-${{ github.run_number }}-${{ matrix.name }}" MAX-Clean-${{ matrix.name }}.apk --title "MAX Clean ${{ matrix.name }} build ${{ github.run_number }}" --notes "Official MAX with third-party trackers removed (variant ${{ matrix.name }})."
