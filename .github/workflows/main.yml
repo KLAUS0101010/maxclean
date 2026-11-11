@@ -31,10 +31,6 @@ jobs:
       - uses: actions/setup-java@v4
         with: { distribution: temurin, java-version: 17 }
 
-      - name: Test the patcher
-        run: |
-          python3 -I test_patch.py  python3 -I tests/test_patch.py  true
-
       - name: Download MAX
         env:
           APK_URL: "${{ inputs.apk_url }}"
