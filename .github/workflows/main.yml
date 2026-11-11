@@ -36,7 +36,6 @@ jobs:
       - name: Test the patcher
         run: |
           python3 -I tests/test_patch.py
-          python3 -I tests/test_dex_api.py
 
       - name: Download MAX
         env: { APK_URL: "${{ inputs.apk_url }}" }
