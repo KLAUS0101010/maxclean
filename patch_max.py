@@ -1,35 +1,4 @@
 #!/usr/bin/env python3
-"""
-MAX Clean patcher (v2). Written against the real decompiled MAX 25.7.x code.
-
-Usage:
-  python3 patch_max.py dex      <apktool folder, decoded with -r>  [hosts|full]
-  python3 patch_max.py manifest <apktool folder, decoded with --no-src>
-
-"dex" mode (tracking removal), every step is reported:
-  1. Hosts of tracking services are replaced with 0.0.0.0 (nothing can be sent there):
-       tracker-api.vk-analytics.ru / tracker-api.my.com   MyTracker (VK)
-       sdk-api.apptracer.ru                               VK Tracer (crashes, profiler, heap dumps, disk usage)
-  2. (mode "full") Send-methods become stubs that return at once:
-       MyTracker.flush / trackLaunchManually / trackLoginEvent / trackRegistrationEvent
-       CallAnalyticsSender.send / forceSendScheduledEvents   (OK.ru calls analytics inside MAX)
-     Not touched on purpose: MyTracker.initTracker / getTrackerParams / handleDeeplink
-     (MAX calls getTrackerParams().setCustomUserId(...) at login, and handleDeeplink() on every opened link).
-  3. (mode "full") MAX's own analytics (events/logs it sends through its own API connection) is switched off with the
-     switch the app already has: PmsKey "analytics-enabled". The method that reads it is made to answer "disabled".
-     All sending code in the app asks this method first and returns early, so nothing else changes.
-  Nothing is deleted, no classes are removed.
-
-"manifest" mode:
-  4. Links: every <data android:host="max.ru"> gets a twin for www.max.ru (same scheme / path rules).
-     If the manifest has no max.ru filter at all, a new filter is added to LinkInterceptorActivity.
-  5. The advertising-id permission (AD_ID) is removed.
-  6. The app name on the launcher becomes "MAX Clean".
-
-Writes patch-report.json into the folder: which smali files were touched (graft_apk.py needs this to
-know which classesN.dex have to be taken from the rebuilt apk).
-Only third-party tracking and MAX's own analytics are handled. Messages, login, calls, push are not touched.
-"""
 import json
 import re
 import sys
@@ -43,7 +12,6 @@ HOSTS = [
     "sdk-api.apptracer.ru",
 ]
 
-# (class file, [void methods that only send data])
 VOID_STUBS = [
     ("com/my/tracker/MyTracker.smali",
      ["flush", "trackLaunchManually", "trackLoginEvent", "trackRegistrationEvent"]),
@@ -51,19 +19,12 @@ VOID_STUBS = [
      ["send", "forceSendScheduledEvents"]),
 ]
 
-# the app's own analytics switch: PmsKey.analytics-enabled (jadx shows it as f<N>analyticsenabled)
 KILL_SWITCH_REF = re.compile(
     r"->(?:analytics-enabled|f\d+analyticsenabled):Lru/ok/tamtam/android/prefs/PmsKey;")
-
-LABEL = "MAX Clean"
-LINK_ACTIVITY = "one.me.android.deeplink.LinkInterceptorActivity"
-WWW = "www.max.ru"
-BARE = "max.ru"
 
 METHOD_HEADER = re.compile(r"^\.method\s+(?P<mods>.*?)(?P<name>[^\s(]+)\((?P<args>[^)]*)\)(?P<ret>\S+)\s*$")
 
 
-# ------------------------------------------------------------------ smali helpers
 def smali_dirs(root: Path):
     return sorted(d for d in root.glob("smali*") if d.is_dir())
 
@@ -81,7 +42,6 @@ def write(p: Path, text: str):
 
 
 def split_methods(text: str):
-    """Yield (kind, lines): kind 'other' for everything outside methods, 'method' for a whole .method..end method."""
     out, cur, in_m = [], [], False
     for line in text.splitlines(keepends=True):
         if not in_m and line.startswith(".method "):
@@ -109,7 +69,6 @@ def has_code(mods: str) -> bool:
 
 
 def rebuild(parts, replace):
-    """replace(lines, header) -> new lines or None to keep."""
     changed = 0
     chunks = []
     for kind, lines in parts:
@@ -123,7 +82,6 @@ def rebuild(parts, replace):
     return "".join(chunks), changed
 
 
-# ------------------------------------------------------------------ dex-side patches
 def replace_hosts(root: Path, touched: set):
     files = total = 0
     for f in smali_files(root):
@@ -162,7 +120,6 @@ def patch_void_stubs(root: Path, touched: set):
 
 
 def patch_kill_switch(root: Path, touched: set):
-    """Every `()Z` method that reads PmsKey.analytics-enabled now returns true ("analytics is disabled")."""
     hits = []
     for f in smali_files(root):
         text = read(f)
@@ -196,24 +153,18 @@ def dex_name(root: Path, f: Path) -> str:
 def run_dex(root: Path, mode: str, report: dict) -> int:
     touched = set()
     files, hosts = replace_hosts(root, touched)
-    print(f"[1] tracker hosts -> {DEAD_HOST}: {hosts} occurrence(s) in {files} file(s)")
+    print(f"[1] tracker hosts -> {DEAD_HOST}: {hosts} in {files} file(s)")
     stubs, kills = {}, []
     if mode == "full":
         stubs = patch_void_stubs(root, touched)
         print(f"[2] send-methods stubbed: {sum(stubs.values())}")
-        for k, v in sorted(stubs.items()):
-            print(f"      {k}: {v}")
         kills = patch_kill_switch(root, touched)
-        print(f"[3] MAX own analytics switched off (analytics-enabled): {sum(n for _, n in kills)} method(s)")
-        for p, n in kills:
-            print(f"      {p}: {n}")
-        if not kills:
-            print("    WARNING: analytics switch not found; MAX's own analytics stays on")
-        if not stubs.get("com/my/tracker/MyTracker.smali"):
-            print("    WARNING: MyTracker stubs not found")
+        print(f"[3] MAX analytics switched off: {sum(n for _, n in kills)} method(s)")
+
     if hosts == 0 and not stubs:
-        print("error: no tracker hosts and no tracker classes found: this does not look like MAX. Nothing patched.")
+        print("error: no tracker hosts found. Nothing patched.")
         return 1
+
     report.update(
         mode=mode,
         hosts_replaced=hosts,
@@ -222,142 +173,24 @@ def run_dex(root: Path, mode: str, report: dict) -> int:
         touched_smali=sorted(p.relative_to(root).as_posix() for p in touched),
         touched_dex=sorted({dex_name(root, p) for p in touched}),
     )
-    print("dex files that changed:", ", ".join(report["touched_dex"]) or "none")
+    print("dex files changed:", ", ".join(report["touched_dex"]) or "none")
     return 0
 
 
-# ------------------------------------------------------------------ manifest patches
-DATA_TAG = re.compile(r"[ \t]*<data\b[^>]*?/>[ \t]*\n?")
-FILTER_BLOCK = re.compile(r"<intent-filter\b[^>]*>.*?</intent-filter>", re.S)
-
-
-def add_www_to_filters(text: str):
-    """In each intent-filter, for every <data ... host=max.ru ...> add the same tag for www.max.ru."""
-    bare_attr = f'android:host="{BARE}"'
-    www_attr = f'android:host="{WWW}"'
-    added = 0
-
-    def fix_block(m):
-        nonlocal added
-        block = m.group(0)
-        out, pos = [], 0
-        for dm in DATA_TAG.finditer(block):
-            tag = dm.group(0)
-            if bare_attr not in tag:
-                continue
-            twin = tag.replace(bare_attr, www_attr)
-            if twin.strip() in block:
-                continue
-            out.append(block[pos:dm.end()])
-            out.append(twin if twin.endswith("\n") else twin + "\n")
-            pos = dm.end()
-            added += 1
-        out.append(block[pos:])
-        return "".join(out)
-
-    return FILTER_BLOCK.sub(fix_block, text), added
-
-
-NEW_FILTER = (
-    '            <intent-filter>\n'
-    '                <action android:name="android.intent.action.VIEW"/>\n'
-    '                <category android:name="android.intent.category.DEFAULT"/>\n'
-    '                <category android:name="android.intent.category.BROWSABLE"/>\n'
-    '                <data android:scheme="https"/>\n'
-    '                <data android:scheme="http"/>\n'
-    f'                <data android:host="{BARE}"/>\n'
-    f'                <data android:host="{WWW}"/>\n'
-    '            </intent-filter>\n'
-)
-
-
-def add_fallback_filter(text: str):
-    """No max.ru filter in the manifest: give the link activity one."""
-    m = re.search(r'<activity\b[^>]*android:name="' + re.escape(LINK_ACTIVITY) + r'"[^>]*?(/?)>', text)
-    if not m:
-        return text, False
-    if m.group(1) == "/":  # <activity .../>  ->  <activity ...> filter </activity>
-        head = m.group(0)[:-2].rstrip() + ">\n"
-        return text[:m.start()] + head + NEW_FILTER + "        </activity>" + text[m.end():], True
-    end = text.find("</activity>", m.end())
-    if end == -1:
-        return text, False
-    return text[:end] + NEW_FILTER + "        " + text[end:], True
-
-
-def remove_ad_id(text: str):
-    return re.subn(r'[ \t]*<uses-permission\b[^>]*com\.google\.android\.gms\.permission\.AD_ID[^>]*/>[ \t]*\n?', "", text)
-
-
-def set_labels(text: str):
-    """Launcher name. The <application> label and the label of the activity with MAIN+LAUNCHER."""
-    n = 0
-
-    def set_attr(tag: str):
-        nonlocal n
-        new, k = re.subn(r'android:label="[^"]*"', f'android:label="{LABEL}"', tag, count=1)
-        n += k
-        return new
-
-    text = re.sub(r"<application\b[^>]*>", lambda m: set_attr(m.group(0)), text, count=1)
-
-    def activity(m):
-        block = m.group(0)
-        if "android.intent.category.LAUNCHER" not in block:
-            return block
-        head_end = block.find(">") + 1
-        return set_attr(block[:head_end]) + block[head_end:]
-
-    text = re.sub(r"<activity\b[^>]*?/>|<activity\b[^>]*?>.*?</activity>", activity, text, flags=re.S)
-    return text, n
-
-
-def run_manifest(root: Path, report: dict) -> int:
-    mf = root / "AndroidManifest.xml"
-    try:
-        text = mf.read_text(encoding="utf-8")
-    except (OSError, UnicodeDecodeError):
-        print("error: AndroidManifest.xml is missing or binary (folder must be decoded with --no-src, not -r)")
-        return 2
-    if "<manifest" not in text:
-        print("error: this is not a decoded manifest")
-        return 2
-    text, www = add_www_to_filters(text)
-    fallback = False
-    if www == 0 and f'android:host="{WWW}"' not in text:
-        text, fallback = add_fallback_filter(text)
-    text, ad = remove_ad_id(text)
-    text, lab = set_labels(text)
-    mf.write_text(text, encoding="utf-8")
-    print(f"[4] www.max.ru added next to max.ru: {www} <data> tag(s); fallback filter added: {fallback}")
-    print(f"[5] AD_ID permission removed: {ad}")
-    print(f"[6] launcher label set to '{LABEL}': {lab} place(s)")
-    if www == 0 and not fallback and f'android:host="{WWW}"' not in text:
-        print(f"error: neither a max.ru filter nor {LINK_ACTIVITY} found in the manifest; links not handled")
-        return 1
-    report.update(manifest=dict(www_added=www, fallback_filter=fallback, ad_id_removed=ad, labels=lab))
-    return 0
-
-
-# ------------------------------------------------------------------ main
 def main(argv):
-    if len(argv) < 3 or argv[1] not in ("dex", "manifest"):
-        print(__doc__)
+    if len(argv) < 3 or argv[1] != "dex":
+        print("Usage: python3 patch_max.py dex <decoded_folder> [hosts|full]")
         return 2
     root = Path(argv[2])
+    mode = argv[3] if len(argv) > 3 else "full"
     report_path = root / "patch-report.json"
     report = json.loads(report_path.read_text()) if report_path.exists() else {}
-    if argv[1] == "dex":
-        mode = argv[3] if len(argv) > 3 else "full"
-        if mode not in ("hosts", "full"):
-            print("mode must be hosts or full")
-            return 2
-        if not smali_dirs(root):
-            print("error: no smali folders in", root)
-            return 2
-        rc = run_dex(root, mode, report)
-    else:
-        rc = run_manifest(root, report)
+
+    if not smali_dirs(root):
+        print("error: no smali folders in", root)
+        return 2
+
+    rc = run_dex(root, mode, report)
     if rc == 0:
         report_path.write_text(json.dumps(report, indent=1, ensure_ascii=False))
     return rc
