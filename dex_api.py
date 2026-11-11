@@ -42,5 +42,5 @@ def main(argv):
     return 0
 
 
-if name == "main":
+if __name__ == "__main__":
     sys.exit(main(sys.argv))
